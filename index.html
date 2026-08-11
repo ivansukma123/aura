@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Advanced HRV Tracker (DSP AI Lokal)</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; padding: 20px; background-color: #f0f2f5; }
+        .card { background: white; padding: 25px; border-radius: 15px; box-shadow: 0 10px 20px rgba(0,0,0,0.1); max-width: 500px; margin: auto; }
+        video { width: 100%; border-radius: 12px; background: #000; margin-bottom: 15px; }
+        button { background: #0056b3; color: white; border: none; padding: 12px 25px; font-size: 16px; font-weight: bold; border-radius: 8px; cursor: pointer; transition: 0.3s; }
+        button:disabled { background: #adb5bd; cursor: not-allowed; }
+        .metrics-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 25px; }
+        .metric-box { padding: 20px; background: #e9ecef; border-radius: 12px; border-left: 5px solid #0056b3; }
+        .metric-title { font-size: 14px; color: #6c757d; text-transform: uppercase; font-weight: bold; }
+        .metric-value { font-size: 32px; font-weight: bold; color: #212529; margin-top: 5px; }
+        #statusText { margin-top: 15px; font-weight: bold; color: #dc3545; }
+    </style>
+</head>
+<body>
+
+    <div class="card">
+        <h2>Pemindai PPG Lanjutan</h2>
+        <p>Tempelkan jari menutupi lensa kamera dan lampu kilat sepenuhnya.</p>
+        
+        <video id="videoElement" autoplay playsinline></video>
+        <canvas id="canvasElement" style="display:none;"></canvas>
+        
+        <button id="startBtn">Mulai Analisis Medis (60 Detik)</button>
+        <p id="statusText">Status: Menunggu...</p>
+
+        <div class="metrics-grid">
+            <div class="metric-box">
+                <div class="metric-title">Heart Rate (BPM)</div>
+                <div class="metric-value" id="bpmValue">--</div>
+            </div>
+            <div class="metric-box">
+                <div class="metric-title">HRV (RMSSD)</div>
+                <div class="metric-value" id="hrvValue">-- ms</div>
+            </div>
+            <div class="metric-box">
+                <div class="metric-title">Kualitas Sinyal</div>
+                <div class="metric-value" id="signalQuality">--</div>
+            </div>
+            <div class="metric-box">
+                <div class="metric-title">Waktu Sisa</div>
+                <div class="metric-value" id="timeValue">60s</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const video = document.getElementById('videoElement');
+        const canvas = document.getElementById('canvasElement');
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        
+        // UI Elements
+        const startBtn = document.getElementById('startBtn');
+        const statusText = document.getElementById('statusText');
+        const bpmValue = document.getElementById('bpmValue');
+        const hrvValue = document.getElementById('hrvValue');
+        const signalQuality = document.getElementById('signalQuality');
+        const timeValue = document.getElementById('timeValue');
+
+        let isMeasuring = false;
+        let animationId;
+        let stream;
+        let track;
+        
+        // Data Buffer untuk Signal Processing
+        const BUFFER_SIZE = 120; // Simpan 120 frame terakhir (sekitar 2 detik pada 60fps)
+        let rawSignal = [];
+        let filteredSignal = [];
+        let timeStamps = [];
+        let peaks = [];
+        let rrIntervals = [];
+        
+        // Parameter Fisiologis
+        const REFRACTORY_PERIOD = 330; // ms (Tidak mungkin berdetak > 180 BPM)
+        let lastPeakTime = 0;
+
+        async function startCamera() {
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } }
+                });
+                video.srcObject = stream;
+                
+                track = stream.getVideoTracks()[0];
+                const capabilities = track.getCapabilities();
+                if (capabilities.torch) {
+                    await track.applyConstraints({ advanced: [{ torch: true }] });
+                }
+                
+                video.onloadedmetadata = () => {
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    video.play();
+                };
+                return true;
+            } catch (err) {
+                alert("Gagal mengakses kamera/flash. Pastikan HTTPS atau Localhost. Error: " + err.message);
+                return false;
+            }
+        }
+
+        // 1. Fungsi Low-Pass Filter (Moving Average)
+        function getMovingAverage(array, windowSize) {
+            if (array.length < windowSize) return array[array.length - 1];
+            let sum = 0;
+            for (let i = array.length - windowSize; i < array.length; i++) {
+                sum += array[i];
+            }
+            return sum / windowSize;
+        }
+
+        // 2. Fungsi Ekstraksi Sinyal
+        function processFrame() {
+            if (!isMeasuring) return;
+
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            
+            // Ambil area kecil di tengah (100x100) untuk stabilitas
+            const frame = ctx.getImageData(canvas.width / 2 - 50, canvas.height / 2 - 50, 100, 100);
+            const data = frame.data;
+            
+            let redSum = 0;
+            // Evaluasi Kualitas: Cek seberapa merah gambarnya
+            let isFingerPlaced = false;
+
+            for (let i = 0; i < data.length; i += 4) {
+                redSum += data[i]; // Channel Merah
+                // Deteksi jika jari benar-benar menempel (merah dominan dibanding warna lain)
+                if (data[i] > 150 && data[i+1] < 100) isFingerPlaced = true;
+            }
+            
+            if (!isFingerPlaced) {
+                signalQuality.innerText = "Jari Lepas!";
+                signalQuality.style.color = "red";
+            } else {
+                signalQuality.innerText = "Bagus";
+                signalQuality.style.color = "green";
+            }
+
+            const redAverage = redSum / (data.length / 4);
+            const currentTime = performance.now();
+
+            rawSignal.push(redAverage);
+            timeStamps.push(currentTime);
+
+            // Terapkan Filter (Menghaluskan Sinyal)
+            // Window 5 frame sangat efektif meredam noise frekuensi tinggi
+            const smoothedValue = getMovingAverage(rawSignal, 5); 
+            filteredSignal.push(smoothedValue);
+
+            // Jaga ukuran buffer memori agar HP tidak lag
+            if (rawSignal.length > BUFFER_SIZE) {
+                rawSignal.shift();
+                filteredSignal.shift();
+                timeStamps.shift();
+            }
+
+            // 3. Algoritma Deteksi Puncak Lanjutan (Dynamic Thresholding)
+            if (filteredSignal.length === BUFFER_SIZE && isFingerPlaced) {
+                // Cari nilai rata-rata dari seluruh buffer saat ini sebagai "Baseline"
+                let bufferAvg = filteredSignal.reduce((a, b) => a + b) / BUFFER_SIZE;
+                
+                // Cari bukit lokal (Local Maxima) di tengah buffer
+                let midIndex = BUFFER_SIZE - 5;
+                let midValue = filteredSignal[midIndex];
+
+                // Puncak valid JIKA: 
+                // 1. Dia adalah bukit (lebih tinggi dari titik sebelum & sesudah)
+                // 2. Dia berada di atas rata-rata garis dasar (Baseline)
+                // 3. Waktu sejak puncak terakhir melebihi Refractory Period
+                if (midValue > filteredSignal[midIndex - 1] && 
+                    midValue > filteredSignal[midIndex + 1] && 
+                    midValue > (bufferAvg * 1.002)) { // Threshold 0.2% di atas rata-rata
+                    
+                    let peakTime = timeStamps[midIndex];
+                    let timeSinceLastPeak = peakTime - lastPeakTime;
+
+                    if (timeSinceLastPeak > REFRACTORY_PERIOD) {
+                        peaks.push(peakTime);
+                        if (lastPeakTime > 0) {
+                            rrIntervals.push(timeSinceLastPeak);
+                            calculateAdvancedMetrics();
+                        }
+                        lastPeakTime = peakTime;
+                    }
+                }
+            }
+
+            animationId = requestAnimationFrame(processFrame);
+        }
+
+        // 4. Kalkulasi HRV Standar Klinis
+        function calculateAdvancedMetrics() {
+            // Butuh minimal 5 detak agar datanya stabil
+            if (rrIntervals.length < 5) return;
+
+            // Pembersihan Outlier: Buang RR interval yang tidak wajar (Mencegah false positive)
+            // Normalnya RR interval tidak berubah lebih dari 20% antar detak
+            let cleanRR = [];
+            for (let i = 1; i < rrIntervals.length; i++) {
+                let ratio = rrIntervals[i] / rrIntervals[i-1];
+                if (ratio > 0.8 && ratio < 1.2) { // Variasi normal
+                    cleanRR.push(rrIntervals[i]);
+                }
+            }
+
+            if (cleanRR.length < 2) return;
+
+            // Hitung BPM
+            const avgRR = cleanRR.reduce((a, b) => a + b) / cleanRR.length;
+            const bpm = Math.round(60000 / avgRR);
+            
+            // Hitung RMSSD (HRV)
+            let sumSquaredDiffs = 0;
+            for (let i = 1; i < cleanRR.length; i++) {
+                const diff = cleanRR[i] - cleanRR[i-1];
+                sumSquaredDiffs += (diff * diff);
+            }
+            const rmssd = Math.round(Math.sqrt(sumSquaredDiffs / (cleanRR.length - 1)));
+
+            // Update UI
+            bpmValue.innerText = bpm;
+            hrvValue.innerText = rmssd + " ms";
+        }
+
+        // Kontrol Waktu dan Tombol
+        startBtn.addEventListener('click', async () => {
+            if (!stream) {
+                const hasCamera = await startCamera();
+                if (!hasCamera) return;
+            }
+            
+            isMeasuring = true;
+            startBtn.disabled = true;
+            statusText.innerText = "Status: Mengukur... JANGAN BERGERAK.";
+            statusText.style.color = "#0056b3";
+            
+            // Reset state
+            rawSignal = [];
+            filteredSignal = [];
+            timeStamps = [];
+            rrIntervals = [];
+            lastPeakTime = 0;
+            bpmValue.innerText = "--";
+            hrvValue.innerText = "-- ms";
+            
+            processFrame();
+
+            // Timer Mundur 60 Detik (Durasi standar HRV medis jangka pendek)
+            let timeLeft = 60;
+            let timerInterval = setInterval(() => {
+                timeLeft--;
+                timeValue.innerText = timeLeft + "s";
+                
+                if (timeLeft <= 0) {
+                    clearInterval(timerInterval);
+                    isMeasuring = false;
+                    cancelAnimationFrame(animationId);
+                    startBtn.disabled = false;
+                    statusText.innerText = "Pengukuran Selesai.";
+                    statusText.style.color = "green";
+                    
+                    if (track) {
+                        track.applyConstraints({ advanced: [{ torch: false }] }).catch(e => console.log(e));
+                    }
+                }
+            }, 1000);
+        });
+    </script>
+</body>
+</html>
